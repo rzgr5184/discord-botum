@@ -1,42 +1,39 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
 import asyncio
 import json
 import os
 from flask import Flask
 from threading import Thread
+from collections import deque
 
-# ================= 7/24 AKTİF TUTMA (FLASK) =================
-app = Flask('')
+# ================= KEEP ALIVE =================
+app = Flask("")
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "Bot 7/24 Aktif!"
+    return "Bot aktif"
 
 def run():
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host="0.0.0.0", port=8080)
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    Thread(target=run).start()
 
-# ================= BOT AYARLARI =================
-# Render panelinde Environment Variables kısmına DISCORD_TOKEN eklemeyi unutma!
-TOKEN = os.getenv("DISCORD_TOKEN") or "TOKEN_BURAYA_GELECEK"
-
+# ================= AYARLAR =================
+TOKEN = os.getenv("DISCORD_TOKEN")
 DATA_FILE = "perm_roles.json"
-DM_DELAY = 2.0
-MAX_ALL_DM = 618
-MAX_FAIL = 5
 
+DM_DELAY = 6.0
+MAX_FAIL = 10
+
+# ================= INTENTS =================
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================= ROL DEPOLAMA =================
+# ================= ROLE STORAGE =================
 def load_roles():
     if not os.path.exists(DATA_FILE):
         return []
@@ -46,18 +43,59 @@ def load_roles():
     except:
         return []
 
-def save_roles(role_ids):
+def save_roles(roles):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(role_ids, f)
+        json.dump(roles, f)
 
 allowed_roles = load_roles()
 
-def has_permission(member: discord.Member):
+def has_permission(member):
     if member.guild_permissions.administrator:
         return True
-    return any(role.id in allowed_roles for role in member.roles)
+    return any(r.id in allowed_roles for r in member.roles)
 
-# ================= MODAL VE MENÜLER =================
+# ================= DM QUEUE + PROGRESS =================
+dm_queue = deque()
+dm_running = False
+dm_total = 0
+dm_sent = 0
+progress_message = None
+
+async def dm_worker():
+    global dm_running, dm_sent, progress_message
+
+    dm_running = True
+    fails = 0
+
+    while dm_queue:
+        member, message = dm_queue.popleft()
+        try:
+            if not member.bot:
+                await member.send(message)
+                dm_sent += 1
+                await asyncio.sleep(DM_DELAY)
+        except:
+            fails += 1
+            if fails >= MAX_FAIL:
+                break
+
+        if progress_message:
+            await progress_message.edit(
+                content=f"📊 **DM Gönderiliyor**\n"
+                        f"✅ Gönderilen: {dm_sent}/{dm_total}\n"
+                        f"⏳ Kalan: {dm_total - dm_sent}"
+            )
+
+    if progress_message:
+        await progress_message.edit(
+            content=f"🎉 **DM Gönderimi Tamamlandı!**\n"
+                    f"✅ Toplam: {dm_sent}/{dm_total}"
+        )
+
+    dm_running = False
+    dm_queue.clear()
+
+# ================= MODAL =================
 class MessageModal(discord.ui.Modal, title="DM Mesajı"):
     message = discord.ui.TextInput(
         label="Gönderilecek mesaj",
@@ -70,84 +108,86 @@ class MessageModal(discord.ui.Modal, title="DM Mesajı"):
         self.members = members
 
     async def on_submit(self, interaction: discord.Interaction):
-        sent = 0
-        failed = 0
-        await interaction.response.send_message("⏳ DM gönderimi başladı...", ephemeral=True)
+        global dm_total, dm_sent, progress_message
 
-        for member in self.members:
-            if member.bot: continue
-            try:
-                await member.send(self.message.value)
-                sent += 1
-                await asyncio.sleep(DM_DELAY)
-            except:
-                failed += 1
-                if failed >= MAX_FAIL: break
+        dm_total = len(self.members)
+        dm_sent = 0
 
-        await interaction.followup.send(f"✅ Gönderilen: {sent}\n❌ Başarısız: {failed}", ephemeral=True)
+        await interaction.response.send_message(
+            f"📊 DM kuyruğa alındı: {dm_total} kişi",
+            ephemeral=True
+        )
 
-class UserPicker(discord.ui.UserSelect):
-    def __init__(self):
-        super().__init__(placeholder="DM atılacak kişileri seç", min_values=1, max_values=25)
+        for m in self.members:
+            dm_queue.append((m, self.message.value))
 
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(MessageModal(self.values))
+        progress_message = await interaction.followup.send(
+            f"📊 **DM Gönderiliyor**\n"
+            f"✅ Gönderilen: 0/{dm_total}\n"
+            f"⏳ Kalan: {dm_total}",
+            ephemeral=True
+        )
 
-class UserPickerView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        self.add_item(UserPicker())
+        if not dm_running:
+            bot.loop.create_task(dm_worker())
 
+# ================= VIEW =================
 class MainView(discord.ui.View):
     def __init__(self, guild):
         super().__init__(timeout=60)
         self.guild = guild
 
-    @discord.ui.button(label="👤 Kişi Seç", style=discord.ButtonStyle.primary)
-    async def pick_users(self, interaction, button):
-        await interaction.response.send_message("Kişileri seç:", view=UserPickerView(), ephemeral=True)
-
     @discord.ui.button(label="🌍 Herkese Gönder", style=discord.ButtonStyle.danger)
-    async def send_all(self, interaction, button):
-        members = [m for m in self.guild.members if not m.bot][:MAX_ALL_DM]
+    async def send_all(self, interaction: discord.Interaction, button):
+        members = [m for m in self.guild.members if not m.bot]
         await interaction.response.send_modal(MessageModal(members))
 
 # ================= KOMUTLAR =================
-@bot.tree.command(name="dm", description="DM gönderme paneli")
+@bot.tree.command(name="dm", description="Herkese DM gönder")
 async def dm(interaction: discord.Interaction):
     if not has_permission(interaction.user):
         await interaction.response.send_message("❌ Yetkin yok.", ephemeral=True)
         return
-    await interaction.response.send_message("📨 **DM Menüsü**", view=MainView(interaction.guild), ephemeral=True)
+
+    await interaction.response.send_message(
+        "📨 **DM Paneli**",
+        view=MainView(interaction.guild),
+        ephemeral=True
+    )
 
 class RolePicker(discord.ui.RoleSelect):
     def __init__(self):
-        super().__init__(placeholder="Rol seçin", min_values=1, max_values=10)
+        super().__init__(placeholder="DM yetkili roller", min_values=1, max_values=10)
 
     async def callback(self, interaction: discord.Interaction):
         global allowed_roles
-        allowed_roles = [role.id for role in self.values]
+        allowed_roles = [r.id for r in self.values]
         save_roles(allowed_roles)
         await interaction.response.send_message("✅ Roller kaydedildi.", ephemeral=True)
 
-class RolePickerView(discord.ui.View):
+class RoleView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__()
         self.add_item(RolePicker())
 
-@bot.tree.command(name="perm", description="Yetkili rollerini ayarla")
+@bot.tree.command(name="perm", description="DM yetkisini ayarla")
 async def perm(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Sadece admin.", ephemeral=True)
         return
-    await interaction.response.send_message("🔐 **Rol Ayarı**", view=RolePickerView(), ephemeral=True)
+    await interaction.response.send_message(
+        "🔐 Yetkili roller:",
+        view=RoleView(),
+        ephemeral=True
+    )
 
-# ================= BAŞLATMA =================
+# ================= READY =================
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Bot aktif: {bot.user}")
 
+# ================= RUN =================
 if __name__ == "__main__":
-    keep_alive() # Web sunucusunu yan kolda başlatır
-    bot.run(TOKEN) # Botu ana kolda başlatır
+    keep_alive()
+    bot.run(TOKEN)
