@@ -63,7 +63,6 @@ progress_message = None
 
 async def dm_worker():
     global dm_running, dm_sent, progress_message
-
     dm_running = True
     fails = 0
 
@@ -88,7 +87,7 @@ async def dm_worker():
 
     if progress_message:
         await progress_message.edit(
-            content=f"🎉 **DM Gönderimi Tamamlandı!**\n"
+            content=f"🎉 **DM Gönderimi Bitti**\n"
                     f"✅ Toplam: {dm_sent}/{dm_total}"
         )
 
@@ -114,7 +113,7 @@ class MessageModal(discord.ui.Modal, title="DM Mesajı"):
         dm_sent = 0
 
         await interaction.response.send_message(
-            f"📊 DM kuyruğa alındı: {dm_total} kişi",
+            f"📊 {dm_total} kişi kuyruğa eklendi.",
             ephemeral=True
         )
 
@@ -131,22 +130,54 @@ class MessageModal(discord.ui.Modal, title="DM Mesajı"):
         if not dm_running:
             bot.loop.create_task(dm_worker())
 
-# ================= VIEW =================
+# ================= USER SELECT =================
+class UserPicker(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="DM atılacak kişileri seç",
+            min_values=1,
+            max_values=25
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            MessageModal(self.values)
+        )
+
+class UserPickerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(UserPicker())
+
+# ================= MAIN VIEW =================
 class MainView(discord.ui.View):
     def __init__(self, guild):
         super().__init__(timeout=60)
         self.guild = guild
 
-    @discord.ui.button(label="🌍 Herkese Gönder", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="👤 Kişi Seçerek Gönder", style=discord.ButtonStyle.primary)
+    async def pick_users(self, interaction: discord.Interaction, button):
+        await interaction.response.send_message(
+            "Kişileri seç:",
+            view=UserPickerView(),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="🌍 Herkese Gönder (700)", style=discord.ButtonStyle.danger)
     async def send_all(self, interaction: discord.Interaction, button):
         members = [m for m in self.guild.members if not m.bot]
-        await interaction.response.send_modal(MessageModal(members))
+        await interaction.response.send_modal(
+            MessageModal(members)
+        )
 
 # ================= KOMUTLAR =================
-@bot.tree.command(name="dm", description="Herkese DM gönder")
+@bot.tree.command(name="dm", description="DM gönderme paneli")
 async def dm(interaction: discord.Interaction):
     if not has_permission(interaction.user):
-        await interaction.response.send_message("❌ Yetkin yok.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Yetkin yok.",
+            ephemeral=True
+        )
         return
 
     await interaction.response.send_message(
@@ -157,13 +188,20 @@ async def dm(interaction: discord.Interaction):
 
 class RolePicker(discord.ui.RoleSelect):
     def __init__(self):
-        super().__init__(placeholder="DM yetkili roller", min_values=1, max_values=10)
+        super().__init__(
+            placeholder="DM yetkili roller",
+            min_values=1,
+            max_values=10
+        )
 
     async def callback(self, interaction: discord.Interaction):
         global allowed_roles
         allowed_roles = [r.id for r in self.values]
         save_roles(allowed_roles)
-        await interaction.response.send_message("✅ Roller kaydedildi.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ Roller kaydedildi.",
+            ephemeral=True
+        )
 
 class RoleView(discord.ui.View):
     def __init__(self):
@@ -173,8 +211,12 @@ class RoleView(discord.ui.View):
 @bot.tree.command(name="perm", description="DM yetkisini ayarla")
 async def perm(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Sadece admin.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Sadece admin.",
+            ephemeral=True
+        )
         return
+
     await interaction.response.send_message(
         "🔐 Yetkili roller:",
         view=RoleView(),
