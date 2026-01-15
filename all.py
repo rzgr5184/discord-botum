@@ -1,172 +1,202 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json
-import os
-from datetime import datetime
+import os, json, asyncio, datetime
 from flask import Flask
 from threading import Thread
 
-# ================= 7/24 AKTİF TUTMA (FLASK) =================
-app = Flask('')
+# ================= 7/24 =================
+app = Flask("")
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "Ticket Botu 7/24 Aktif!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
+    return "Ticket Bot Aktif"
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
-# ================= AYARLAR =================
-# Güvenlik için TOKEN'ı Render panelinden DISCORD_TOKEN adıyla ekle!
-TOKEN = os.getenv("DISCORD_TOKEN") or "MTQ1OTk5Mzk0NzY1NTkwMTI0Nw.GcBMjD.FQVCHtz1oLSVj1rBNV7AtFqW_rBFxKSTSPz4d8"
+# ================= AYAR =================
+TOKEN = os.getenv("DISCORD_TOKEN")
+DATA_FILE = "ticket_data.json"
+AUTO_CLOSE_MINUTES = 60
 
+TICKET_CATEGORIES = {
+    "ekip": "👥 Ekip Alım",
+    "ally": "🤝 Ally / Merge",
+    "partner": "🤝 Partnerlik",
+    "destek": "💬 Genel Destek"
+}
+
+# ================= INTENTS =================
 intents = discord.Intents.default()
-intents.guilds = True
 intents.members = True
-intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "data.json"
-TRANSCRIPT_DIR = "transcripts"
-
-os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
-
-# Data dosyası yoksa oluştur (Hata vermemesi için eklendi)
+# ================= DATA =================
 if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({"roles": {"ekip_alim": [], "ally_merge": [], "partnerlik": [], "genel_destek": []}}, f)
+    with open(DATA_FILE, "w") as f:
+        json.dump({
+            "roles": {},
+            "log_channel": None,
+            "ticket_count": 0
+        }, f)
 
 def load():
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
+    with open(DATA_FILE, "r") as f:
         return json.load(f)
 
 def save(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-# ---------------- TRANSCRIPT ----------------
-async def create_transcript(channel: discord.TextChannel):
-    messages = [m async for m in channel.history(limit=None, oldest_first=True)]
-    html = f"<html><head><meta charset='utf-8'><title>Transcript - {channel.name}</title></head><body><h2>{channel.name}</h2><hr>"
-    for msg in messages:
-        time = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        html += f"<p><b>{msg.author}</b> [{time}]: {msg.content}</p>"
-    html += "</body></html>"
-    path = f"{TRANSCRIPT_DIR}/{channel.name}.html"
+# ================= TRANSCRIPT =================
+async def create_transcript(channel):
+    messages = []
+    async for msg in channel.history(limit=None, oldest_first=True):
+        time = msg.created_at.strftime("%Y-%m-%d %H:%M")
+        messages.append(f"<p><b>[{time}] {msg.author}:</b> {msg.content}</p>")
+
+    html = f"""
+    <html><body>
+    <h2>Transcript: {channel.name}</h2>
+    {''.join(messages)}
+    </body></html>
+    """
+
+    path = f"transcript-{channel.id}.html"
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
+
     return path
 
-# ---------------- UI ----------------
-class CloseButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="🔒 Ticket Kapat", style=discord.ButtonStyle.danger)
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message("📄 Transcript oluşturuluyor...", ephemeral=True)
-        path = await create_transcript(interaction.channel)
-        await interaction.channel.send("📄 **Transcript:**", file=discord.File(path))
-        await asyncio.sleep(3) # Silinmeden önce kısa bir bekleme
-        await interaction.channel.delete()
-
+# ================= UI =================
 class CloseView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(CloseButton())
 
-class TicketSelect(discord.ui.Select):
+    @discord.ui.button(label="🔒 Kapat", style=discord.ButtonStyle.secondary)
+    async def close(self, interaction: discord.Interaction, button):
+        await interaction.response.send_message("⏳ Ticket kapatılıyor...", ephemeral=True)
+        await auto_close(interaction.channel)
+
+    @discord.ui.button(label="🗑️ Sil", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, button):
+        await interaction.channel.delete()
+
+async def auto_close(channel):
+    data = load()
+    log_id = data["log_channel"]
+    transcript = await create_transcript(channel)
+
+    if log_id:
+        log = channel.guild.get_channel(log_id)
+        if log:
+            await log.send(
+                f"📑 Ticket kapandı: {channel.name}",
+                file=discord.File(transcript)
+            )
+
+    await asyncio.sleep(5)
+    await channel.delete()
+
+class CategorySelect(discord.ui.Select):
     def __init__(self):
-        options = [
-            discord.SelectOption(label="Ekip Alım", value="ekip_alim", emoji="🧑‍💻"),
-            discord.SelectOption(label="Ally.Merge", value="ally_merge", emoji="🤝"),
-            discord.SelectOption(label="Partnerlik", value="partnerlik", emoji="📢"),
-            discord.SelectOption(label="Genel Destek", value="genel_destek", emoji="🆘")
-        ]
-        super().__init__(placeholder="Kategori seç", options=options)
+        super().__init__(
+            placeholder="Kategori seç",
+            options=[discord.SelectOption(label=v, value=k) for k, v in TICKET_CATEGORIES.items()]
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        user = interaction.user
-        category = self.values[0]
+        data = load()
+        data["ticket_count"] += 1
+        save(data)
 
+        guild = interaction.guild
+        roles = data["roles"].get(self.values[0], [])
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            interaction.user: discord.PermissionOverwrite(view_channel=True)
         }
 
-        channel = await guild.create_text_channel(f"ticket-{user.name}", overwrites=overwrites)
-        data = load()
-        mentions = [guild.get_role(r).mention for r in data["roles"].get(category, []) if guild.get_role(r)]
+        mentions = []
+        for rid in roles:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True)
+                mentions.append(role.mention)
 
-        embed = discord.Embed(
-            title="🎫 Ticket Açıldı",
-            description=f"**Kategori:** {category.replace('_',' ').title()}\n**Açan:** {user.mention}",
-            color=discord.Color.blurple()
+        channel = await guild.create_text_channel(
+            f"ticket-{data['ticket_count']}",
+            overwrites=overwrites
         )
-        await channel.send(content=" ".join(mentions) if mentions else None, embed=embed, view=CloseView())
-        await interaction.response.send_message(f"✅ Ticket oluşturuldu: {channel.mention}", ephemeral=True)
 
-class TicketView(discord.ui.View):
+        await channel.send(
+            f"{interaction.user.mention} ticket açtı\n{' '.join(mentions)}",
+            view=CloseView()
+        )
+
+        await interaction.response.send_message(
+            f"✅ Ticket oluşturuldu: {channel.mention}",
+            ephemeral=True
+        )
+
+        bot.loop.create_task(auto_timeout(channel))
+
+async def auto_timeout(channel):
+    await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
+    if channel:
+        await auto_close(channel)
+
+class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(TicketSelect())
 
-class TicketButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="🎫 Ticket Aç", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="🎫 Ticket Aç", style=discord.ButtonStyle.primary)
+    async def open(self, interaction: discord.Interaction, button):
+        await interaction.response.send_message(
+            "Kategori seç:",
+            view=discord.ui.View().add_item(CategorySelect()),
+            ephemeral=True
+        )
 
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message("Kategori seç:", view=TicketView(), ephemeral=True)
+# ================= KOMUTLAR =================
+@bot.tree.command(name="main")
+async def main(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Yetkin yok", ephemeral=True)
 
-class MainView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(TicketButton())
+    await channel.send("🎟️ **Ticket Sistemi**", view=PanelView())
+    await interaction.response.send_message("✅ Panel kuruldu", ephemeral=True)
 
-# ---------------- COMMANDS ----------------
+@bot.tree.command(name="add")
+async def add(interaction: discord.Interaction, category: str):
+    if category not in TICKET_CATEGORIES:
+        return await interaction.response.send_message("❌ Geçersiz kategori", ephemeral=True)
+
+    class RoleSelect(discord.ui.RoleSelect):
+        async def callback(self, interaction):
+            data = load()
+            data["roles"][category] = [r.id for r in self.values]
+            save(data)
+            await interaction.response.send_message("✅ Roller kaydedildi", ephemeral=True)
+
+    view = discord.ui.View()
+    view.add_item(RoleSelect())
+    await interaction.response.send_message("Rolleri seç:", view=view, ephemeral=True)
+
+@bot.tree.command(name="log")
+async def log(interaction: discord.Interaction, channel: discord.TextChannel):
+    data = load()
+    data["log_channel"] = channel.id
+    save(data)
+    await interaction.response.send_message("✅ Log kanalı ayarlandı", ephemeral=True)
+
+# ================= READY =================
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    # Bot kapandığında butonların çalışmaya devam etmesi için (Persistent Views)
-    bot.add_view(MainView())
-    bot.add_view(CloseView())
-    print(f"✅ {bot.user} olarak giriş yapıldı ve Ticket sistemi hazır!")
+    print("Ticket Bot Aktif")
 
-@bot.tree.command(name="main", description="Ticket panelini seçilen kanala gönder")
-@app_commands.checks.has_permissions(administrator=True)
-async def main(interaction: discord.Interaction, channel: discord.TextChannel):
-    embed = discord.Embed(
-        title="🎫 Destek Sistemi",
-        description="Ticket açmak için aşağıdaki butona bas",
-        color=discord.Color.green()
-    )
-    await channel.send(embed=embed, view=MainView())
-    await interaction.response.send_message("✅ Panel gönderildi", ephemeral=True)
-
-@bot.tree.command(name="add", description="Kategoriye rol ekle")
-@app_commands.checks.has_permissions(administrator=True)
-async def add(interaction: discord.Interaction, category: str, role: discord.Role):
-    data = load()
-    if category not in data["roles"]:
-        await interaction.response.send_message("❌ Geçersiz kategori", ephemeral=True)
-        return
-    if role.id not in data["roles"][category]:
-        data["roles"][category].append(role.id)
-        save(data)
-    await interaction.response.send_message(f"✅ {role.mention} → **{category.replace('_',' ').title()}**", ephemeral=True)
-
-@add.autocomplete("category")
-async def cat_auto(interaction: discord.Interaction, current: str):
-    cats = {"Ekip Alım": "ekip_alim", "Ally.Merge": "ally_merge", "Partnerlik": "partnerlik", "Genel Destek": "genel_destek"}
-    return [app_commands.Choice(name=k, value=v) for k, v in cats.items() if current.lower() in k.lower()]
-
-# ---------------- ÇALIŞTIRMA ----------------
 if __name__ == "__main__":
-    keep_alive() # Render uyanık tutma sunucusu
+    keep_alive()
     bot.run(TOKEN)
